@@ -1,0 +1,19 @@
+[Unit]
+Description=OneManCloud Node Agent
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=omc
+Group=omc
+EnvironmentFile=/etc/omc/agent.env
+WorkingDirectory=/opt/onemancloud/repo/node/agent
+ExecStart=/usr/bin/pnpm --filter @omc/agent start -- --name oracle-arm
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

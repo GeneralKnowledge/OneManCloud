@@ -1,0 +1,28 @@
+{
+  "name": "@omc/control-plane",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "types": "wrangler types",
+    "build": "wrangler deploy --dry-run --outdir=dist",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "lint": "echo 'no lint configured'",
+    "db:local": "CI=true wrangler d1 migrations apply DB --local"
+  },
+  "dependencies": {
+    "@omc/protocol": "workspace:*",
+    "@omc/shared": "workspace:*",
+    "hono": "^4.9.8"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.8.71",
+    "@cloudflare/workers-types": "^5.20261004.1",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4",
+    "wrangler": "^4.40.3"
+  }
+}

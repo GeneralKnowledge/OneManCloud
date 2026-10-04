@@ -1,0 +1,30 @@
+{
+  "name": "onemancloud",
+  "private": true,
+  "version": "0.1.0",
+  "description": "A tiny personal cloud control plane assembled from free infrastructure",
+  "packageManager": "pnpm@10.33.3",
+  "scripts": {
+    "dev": "pnpm --filter @omc/control-plane dev",
+    "build": "pnpm -r --filter './packages/*' build && pnpm -r --filter './apps/*' --filter './node/*' build",
+    "test": "pnpm -r test",
+    "typecheck": "pnpm -r typecheck",
+    "lint": "pnpm -r lint",
+    "omc": "node --import tsx apps/cli/src/index.ts"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.2",
+    "tsx": "^4.20.5",
+    "vitest": "^3.2.4"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild",
+      "sharp",
+      "workerd"
+    ]
+  }
+}

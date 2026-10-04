@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.wrangler/
+.dev.vars
+.env
+.env.local
+*.log
+.DS_Store
+coverage/
+.turbo/
+*.tsbuildinfo
+.omc/
+apps/control-plane/.wrangler/
+apps/control-plane/worker-configuration.d.ts
