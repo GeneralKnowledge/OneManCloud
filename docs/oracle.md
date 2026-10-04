@@ -7,17 +7,24 @@ agent.
 ## Steps
 
 1. Create an Ubuntu ARM64 Always Free instance.
-2. Clone this repository onto the VM (or copy a release tarball).
-3. Run the installer as root:
+2. From your laptop (operator CLI), register the node and save the token:
+
+```bash
+omc node register --name oracle-arm
+# prints OMC_NODE_TOKEN — save it
+```
+
+3. Clone this repository onto the VM (or copy a release tarball).
+4. Run the installer as root with the **node** token (not the operator token):
 
 ```bash
 export OMC_URL="https://api.your-domain.com"
-export OPERATOR_TOKEN="…"
+export OMC_NODE_TOKEN="…"   # from omc node register
 export OMC_NODE_NAME="oracle-arm"
 sudo -E ./scripts/install-node.sh
 ```
 
-4. Confirm:
+5. Confirm:
 
 ```bash
 omc nodes

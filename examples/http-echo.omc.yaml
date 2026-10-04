@@ -10,4 +10,5 @@ compute:
 network:
   public: true
   port: 5678
-sleep: false
+env:
+  OMC_EXAMPLE: "1"

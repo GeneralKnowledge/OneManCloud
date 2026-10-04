@@ -54,10 +54,11 @@ omc apps register --file examples/http-echo.omc.yaml
 omc deploy http-echo
 ```
 
-5. Inspect the model:
+5. Print concrete ingress suggestions:
 
 ```bash
 omc tunnel
+# http-echo.example.com  →  http://localhost:5678
 ```
 
 6. When you add a new node later, run `omc deploy <app>` again so a replica is

@@ -89,6 +89,7 @@ statusRoutes.get("/v1/status", requireOperator, async (c) => {
         cpuCount: n.cpuCount,
         memoryMb: n.memoryMb,
         lastHeartbeatAt: n.lastHeartbeatAt,
+        runningApplications: n.runningApplications,
       };
     }),
     applications: (appsResult.results ?? []).map((row) => {

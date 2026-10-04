@@ -10,8 +10,10 @@ import { formatBytes } from "@omc/shared";
 import type {
   ApplicationConfig,
   JobRecord,
+  JobStatus,
   NodeRecord,
   StatusResponse,
+  TunnelSuggestResponse,
 } from "@omc/protocol";
 import { parse as parseYaml } from "yaml";
 
@@ -76,6 +78,45 @@ function has(args: string[], name: string): boolean {
   return args.includes(name);
 }
 
+const TERMINAL: JobStatus[] = ["SUCCEEDED", "FAILED"];
+
+export async function waitForJobs(
+  jobIds: string[],
+  options: {
+    pollMs?: number;
+    fetchJob: (id: string) => Promise<JobRecord>;
+    fetchLogs: (id: string) => Promise<Array<{ seq: number; line: string }>>;
+    onLog?: (jobId: string, line: string) => void;
+  },
+): Promise<{ ok: boolean; jobs: JobRecord[] }> {
+  const pollMs = options.pollMs ?? 1000;
+  const seenSeq = new Map<string, number>();
+  for (const id of jobIds) seenSeq.set(id, 0);
+
+  for (;;) {
+    const jobs: JobRecord[] = [];
+    for (const id of jobIds) {
+      const job = await options.fetchJob(id);
+      jobs.push(job);
+      const logs = await options.fetchLogs(id);
+      const last = seenSeq.get(id) ?? 0;
+      for (const line of logs) {
+        if (line.seq > last) {
+          options.onLog?.(id, line.line);
+          seenSeq.set(id, line.seq);
+        }
+      }
+    }
+    if (jobs.every((j) => TERMINAL.includes(j.status))) {
+      return {
+        ok: jobs.every((j) => j.status === "SUCCEEDED"),
+        jobs,
+      };
+    }
+    await new Promise((r) => setTimeout(r, pollMs));
+  }
+}
+
 async function cmdLogin(args: string[]): Promise<void> {
   const url =
     flag(args, "--url") ?? process.env.OMC_URL ?? "http://127.0.0.1:8787";
@@ -106,8 +147,12 @@ async function cmdStatus(): Promise<void> {
     for (const n of status.nodes) {
       const cpu = n.cpuCount != null ? `${n.cpuCount} CPU` : "-";
       const mem = formatBytes(n.memoryMb);
+      const apps =
+        n.runningApplications.length > 0
+          ? n.runningApplications.join(",")
+          : "-";
       console.log(
-        `  ${n.name.padEnd(14)} ${n.status.padEnd(10)} ${cpu.padEnd(8)} ${mem}`,
+        `  ${n.name.padEnd(14)} ${n.status.padEnd(10)} ${cpu.padEnd(8)} ${mem.padEnd(8)} ${apps}`,
       );
     }
   }
@@ -129,11 +174,16 @@ async function cmdNodes(): Promise<void> {
       "STATUS".padEnd(10) +
       "ARCH".padEnd(8) +
       "CPU".padEnd(6) +
-      "MEMORY",
+      "MEMORY".padEnd(8) +
+      "RUNNING",
   );
   for (const n of body.nodes) {
+    const apps =
+      n.runningApplications.length > 0
+        ? n.runningApplications.join(",")
+        : "-";
     console.log(
-      `${n.name.padEnd(14)}${n.status.padEnd(10)}${(n.arch ?? "-").padEnd(8)}${String(n.cpuCount ?? "-").padEnd(6)}${formatBytes(n.memoryMb)}`,
+      `${n.name.padEnd(14)}${n.status.padEnd(10)}${(n.arch ?? "-").padEnd(8)}${String(n.cpuCount ?? "-").padEnd(6)}${formatBytes(n.memoryMb).padEnd(8)}${apps}`,
     );
   }
   if (body.nodes.length === 0) {
@@ -157,6 +207,12 @@ async function cmdNodeRegister(args: string[]): Promise<void> {
   console.log(`Registered node ${body.node.name} (${body.node.id})`);
   console.log(`Node token (save now, shown once):`);
   console.log(body.token);
+  console.log("");
+  console.log("On the node, set:");
+  console.log(`  OMC_URL=<control-plane-url>`);
+  console.log(`  OMC_NODE_TOKEN=${body.token}`);
+  console.log(`  OMC_NODE_NAME=${body.node.name}`);
+  console.log("Do NOT copy the operator token onto the node.");
 }
 
 async function cmdNodeStatus(args: string[]): Promise<void> {
@@ -164,6 +220,13 @@ async function cmdNodeStatus(args: string[]): Promise<void> {
   if (!id) throw new Error("Usage: omc node status <id>");
   const body = await api<{ node: NodeRecord }>("GET", `/v1/nodes/${id}`);
   console.log(JSON.stringify(body.node, null, 2));
+}
+
+async function cmdNodeRevoke(args: string[]): Promise<void> {
+  const id = args[0];
+  if (!id) throw new Error("Usage: omc node revoke <id>");
+  await api("POST", `/v1/nodes/${id}/revoke`, {});
+  console.log(`Revoked node ${id}`);
 }
 
 async function cmdApps(): Promise<void> {
@@ -193,9 +256,34 @@ async function cmdAppRegister(args: string[]): Promise<void> {
   console.log(`Registered application ${body.application.name}`);
 }
 
+async function streamJobsUntilDone(jobIds: string[]): Promise<boolean> {
+  const result = await waitForJobs(jobIds, {
+    fetchJob: async (id) => {
+      const body = await api<{ job: JobRecord }>("GET", `/v1/jobs/${id}`);
+      return body.job;
+    },
+    fetchLogs: async (id) => {
+      const body = await api<{ logs: Array<{ seq: number; line: string }> }>(
+        "GET",
+        `/v1/jobs/${id}/logs`,
+      );
+      return body.logs;
+    },
+    onLog: (jobId, line) => {
+      const short = jobId.slice(0, 12);
+      console.log(`[${short}] ${line}`);
+    },
+  });
+  for (const job of result.jobs) {
+    console.log(`Job ${job.id}  ${job.status}`);
+  }
+  return result.ok;
+}
+
 async function cmdDeploy(args: string[]): Promise<void> {
-  const name = args[0];
-  if (!name) throw new Error("Usage: omc deploy <app-name>");
+  const name = args.find((a) => !a.startsWith("--"));
+  if (!name) throw new Error("Usage: omc deploy <app-name> [--wait]");
+  const shouldWait = has(args, "--wait");
   const body = await api<{
     mode?: string;
     targetNodes?: number;
@@ -214,7 +302,8 @@ async function cmdDeploy(args: string[]): Promise<void> {
       `Deployment ${dep.id}  ${dep.status}  node=${"nodeId" in dep ? dep.nodeId ?? "(any)" : "-"}`,
     );
   }
-  for (const job of body.jobs ?? [body.job]) {
+  const jobs = body.jobs ?? [body.job];
+  for (const job of jobs) {
     console.log(`Job        ${job.id}  ${job.status}  node=${job.nodeId ?? "(any)"}`);
   }
   if (body.publishPort) {
@@ -231,6 +320,46 @@ async function cmdDeploy(args: string[]): Promise<void> {
       "(Expose via Cloudflare Tunnel replicas — see omc tunnel / docs/tunnel.md)",
     );
   }
+
+  if (shouldWait) {
+    console.log("Waiting for deploy jobs…");
+    const ok = await streamJobsUntilDone(jobs.map((j) => j.id));
+    if (!ok) process.exitCode = 1;
+  }
+}
+
+async function cmdStop(args: string[]): Promise<void> {
+  const name = args.find((a) => !a.startsWith("--"));
+  if (!name) throw new Error("Usage: omc stop <app-name> [--wait]");
+  const shouldWait = has(args, "--wait");
+  const body = await api<{
+    name: string;
+    stoppedNodes: number;
+    jobs: JobRecord[];
+  }>("POST", `/v1/apps/${name}/stop`, {});
+  console.log(`Stopped ${body.name} on ${body.stoppedNodes} node(s)`);
+  for (const job of body.jobs) {
+    console.log(`Job ${job.id}  ${job.status}  node=${job.nodeId ?? "-"}`);
+  }
+  if (shouldWait && body.jobs.length > 0) {
+    const ok = await streamJobsUntilDone(body.jobs.map((j) => j.id));
+    if (!ok) process.exitCode = 1;
+  }
+}
+
+async function cmdAppLogs(args: string[]): Promise<void> {
+  const name = args.find((a) => !a.startsWith("--"));
+  if (!name) throw new Error("Usage: omc apps logs <app-name> [--tail N]");
+  const tailRaw = flag(args, "--tail");
+  const tail = tailRaw ? Number(tailRaw) : 100;
+  const body = await api<{ job: JobRecord; nodeId: string }>(
+    "POST",
+    `/v1/apps/${name}/logs`,
+    { tail },
+  );
+  console.log(`Job ${body.job.id} on node ${body.nodeId}`);
+  const ok = await streamJobsUntilDone([body.job.id]);
+  if (!ok) process.exitCode = 1;
 }
 
 async function cmdJobs(args: string[]): Promise<void> {
@@ -274,11 +403,22 @@ async function cmdLogs(args: string[]): Promise<void> {
 }
 
 async function cmdTunnel(): Promise<void> {
-  const body = await api<{ model: Record<string, unknown> }>(
-    "GET",
-    "/v1/tunnel",
-  );
-  console.log(JSON.stringify(body.model, null, 2));
+  const body = await api<TunnelSuggestResponse>("GET", "/v1/tunnel");
+  console.log("Cloudflare Tunnel suggest (replicas / failover)");
+  console.log(`Base domain  ${body.baseDomain ?? "(set: omc config set base_domain example.com)"}`);
+  console.log(`Mode         ${body.mode}`);
+  console.log("Ingress");
+  if (body.ingress.length === 0) {
+    console.log("  (no public apps with port + base_domain)");
+  } else {
+    for (const line of body.ingress) {
+      console.log(`  ${line.hostname}  →  ${line.service}`);
+    }
+  }
+  console.log("Checklist");
+  for (const step of body.checklist) {
+    console.log(`  - ${step}`);
+  }
 }
 
 async function cmdConfig(args: string[]): Promise<void> {
@@ -319,10 +459,13 @@ Usage:
   omc nodes
   omc node register [--name NAME]
   omc node status <id>
+  omc node revoke <id>
   omc node local [--name NAME] [--once]
   omc apps
   omc apps register --file <path>
-  omc deploy <app>
+  omc apps logs <app> [--tail N]
+  omc deploy <app> [--wait]
+  omc stop <app> [--wait]
   omc jobs
   omc jobs create --type noop [--payload JSON]
   omc jobs show <id>
@@ -351,15 +494,20 @@ async function main(): Promise<void> {
     case "node":
       if (rest[0] === "register") await cmdNodeRegister(rest.slice(1));
       else if (rest[0] === "status") await cmdNodeStatus(rest.slice(1));
+      else if (rest[0] === "revoke") await cmdNodeRevoke(rest.slice(1));
       else if (rest[0] === "local") await cmdNodeLocal(rest.slice(1));
       else usage();
       break;
     case "apps":
       if (rest[0] === "register") await cmdAppRegister(rest.slice(1));
+      else if (rest[0] === "logs") await cmdAppLogs(rest.slice(1));
       else await cmdApps();
       break;
     case "deploy":
       await cmdDeploy(rest);
+      break;
+    case "stop":
+      await cmdStop(rest);
       break;
     case "jobs":
       await cmdJobs(rest);
@@ -378,7 +526,15 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((err) => {
-  console.error(err instanceof Error ? err.message : err);
-  process.exit(1);
-});
+const isMain =
+  process.argv[1] != null &&
+  (process.argv[1].endsWith("/apps/cli/src/index.ts") ||
+    process.argv[1].endsWith("/apps/cli/bin/omc.js") ||
+    process.argv[1].endsWith("omc.js"));
+
+if (isMain) {
+  main().catch((err) => {
+    console.error(err instanceof Error ? err.message : err);
+    process.exit(1);
+  });
+}

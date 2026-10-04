@@ -116,6 +116,16 @@ nodeRoutes.get("/v1/nodes", requireOperator, async (c) => {
   return c.json({ nodes: (result.results ?? []).map(mapNode) });
 });
 
+/** Resolve identity from a node bearer token (no operator secret on the host). */
+nodeRoutes.get("/v1/nodes/me", requireNode, async (c) => {
+  const nodeId = c.get("nodeId")!;
+  const row = await c.env.DB.prepare(`SELECT * FROM nodes WHERE id = ?`)
+    .bind(nodeId)
+    .first<NodeRow>();
+  if (!row) return c.json({ error: "Node not found" }, 404);
+  return c.json({ node: mapNode(row) });
+});
+
 nodeRoutes.get("/v1/nodes/:id", requireOperator, async (c) => {
   const row = await c.env.DB.prepare(`SELECT * FROM nodes WHERE id = ?`)
     .bind(c.req.param("id"))
@@ -128,6 +138,9 @@ nodeRoutes.post("/v1/nodes/heartbeat", requireNode, async (c) => {
   const nodeId = c.get("nodeId")!;
   const body = await c.req.json<HeartbeatPayload>();
   const now = Date.now();
+  const running = Array.isArray(body.runningApplications)
+    ? body.runningApplications.filter((x): x is string => typeof x === "string")
+    : [];
 
   await c.env.DB.prepare(
     `UPDATE nodes
@@ -139,6 +152,7 @@ nodeRoutes.post("/v1/nodes/heartbeat", requireNode, async (c) => {
          disk_gb = ?,
          agent_version = ?,
          last_heartbeat_at = ?,
+         running_apps_json = ?,
          updated_at = ?
      WHERE id = ?`,
   )
@@ -150,12 +164,17 @@ nodeRoutes.post("/v1/nodes/heartbeat", requireNode, async (c) => {
       body.diskGb,
       body.agentVersion,
       now,
+      JSON.stringify(running),
       now,
       nodeId,
     )
     .run();
 
-  structuredLog("NODE_HEARTBEAT", { nodeId, name: c.get("nodeName") });
+  structuredLog("NODE_HEARTBEAT", {
+    nodeId,
+    name: c.get("nodeName"),
+    runningApplications: running,
+  });
   return c.json({ ok: true, status: "ONLINE", serverTime: now });
 });
 

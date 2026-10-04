@@ -103,16 +103,33 @@ and `./scripts/install-node.sh`.
 
 ```bash
 pnpm omc apps register --file examples/http-echo.omc.yaml
-pnpm omc deploy http-echo
+pnpm omc deploy http-echo --wait
+pnpm omc apps logs http-echo
+pnpm omc tunnel          # ingress lines for Cloudflare Tunnel
+pnpm omc stop http-echo
 ```
 
-With a node online, the agent pulls/runs the image. Public exposure uses
-Cloudflare Tunnel — see [docs/tunnel.md](docs/tunnel.md).
+With a node online, the agent pulls/runs the image (env + memory/cpu limits
+applied). Public exposure uses Cloudflare Tunnel — see [docs/tunnel.md](docs/tunnel.md).
+
+## Register a remote node (no operator token on the VM)
+
+```bash
+# on your laptop
+pnpm omc node register --name oracle-arm
+# copy the printed OMC_NODE_TOKEN to the VM
+
+# on the VM
+export OMC_URL="https://api.your-domain.com"
+export OMC_NODE_TOKEN="…"
+export OMC_NODE_NAME="oracle-arm"
+sudo -E ./scripts/install-node.sh
+```
 
 ## Security model
 
-- Single operator token (`OPERATOR_TOKEN`)
-- Per-node tokens (hashed in D1, revocable)
+- Single operator token (`OPERATOR_TOKEN`) — CLI / laptop only
+- Per-node tokens (hashed in D1, revocable); nodes never store the operator token
 - Typed jobs only — no remote shell API
 - Docker on a node is privileged — see [docs/security.md](docs/security.md)
 
@@ -158,5 +175,4 @@ complex IAM, multi-region consensus, automatic cloud purchasing.
 
 ## License
 
-MIT (see LICENSE if present; otherwise all rights reserved by the repository
-owner until a license file is added).
+MIT — see [LICENSE](LICENSE).

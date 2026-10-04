@@ -105,15 +105,27 @@ describe("nodes", () => {
           memoryMb: 8192,
           diskGb: 50,
           agentVersion: "0.1.0",
+          runningApplications: ["omc-http-echo"],
         }),
       },
       token,
     );
     expect(hb.status).toBe(200);
 
+    const me = await request("/v1/nodes/me", {}, token);
+    expect(me.status).toBe(200);
+    const meBody = await me.json<{
+      node: { id: string; runningApplications: string[] };
+    }>();
+    expect(meBody.node.id).toBe(node.id);
+    expect(meBody.node.runningApplications).toEqual(["omc-http-echo"]);
+
     const list = await request("/v1/nodes", {}, OP());
-    const listed = await list.json<{ nodes: Array<{ id: string }> }>();
-    expect(listed.nodes.some((n) => n.id === node.id)).toBe(true);
+    const listed = await list.json<{
+      nodes: Array<{ id: string; runningApplications: string[] }>;
+    }>();
+    const found = listed.nodes.find((n) => n.id === node.id);
+    expect(found?.runningApplications).toEqual(["omc-http-echo"]);
   });
 
   it("rejects invalid node token on heartbeat", async () => {
@@ -359,12 +371,17 @@ describe("applications", () => {
           source: { type: "image", image: "hashicorp/http-echo:1.0.0" },
           compute: { memory: "128mb", cpu: 1 },
           network: { public: true, port: 5678 },
-          sleep: false,
+          env: { GREETING: "hi" },
         }),
       },
       OP(),
     );
     expect(create.status).toBe(201);
+    const created = await create.json<{
+      application: { env: Record<string, string>; memoryMb: number };
+    }>();
+    expect(created.application.env).toEqual({ GREETING: "hi" });
+    expect(created.application.memoryMb).toBe(128);
 
     const deploy = await request(
       `/v1/apps/${name}/deploy`,
@@ -375,7 +392,7 @@ describe("applications", () => {
     const body = await deploy.json<{
       mode: string;
       targetNodes: number;
-      job: { status: string; type: string };
+      job: { status: string; type: string; payloadJson: string };
       deployment: { status: string; publicUrl: string | null };
       jobs: unknown[];
     }>();
@@ -386,6 +403,176 @@ describe("applications", () => {
     expect(body.deployment.status).toBe("PENDING");
     expect(body.deployment.publicUrl).toContain(name);
     expect(body.jobs).toHaveLength(1);
+    const payload = JSON.parse(body.job.payloadJson) as {
+      env: Record<string, string>;
+      memoryMb: number;
+    };
+    expect(payload.env).toEqual({ GREETING: "hi" });
+    expect(payload.memoryMb).toBe(128);
+  });
+
+  it("suggests tunnel ingress for public apps", async () => {
+    await request(
+      "/v1/config/base_domain",
+      { method: "PUT", body: JSON.stringify({ value: "example.com" }) },
+      OP(),
+    );
+    const name = `tun-${crypto.randomUUID().slice(0, 8)}`;
+    await request(
+      "/v1/apps",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          name,
+          runtime: "docker",
+          source: { type: "image", image: "hashicorp/http-echo:1.0.0" },
+          network: { public: true, port: 5678 },
+        }),
+      },
+      OP(),
+    );
+    const res = await request("/v1/tunnel", {}, OP());
+    expect(res.status).toBe(200);
+    const body = await res.json<{
+      baseDomain: string;
+      ingress: Array<{ app: string; hostname: string; service: string }>;
+    }>();
+    expect(body.baseDomain).toBe("example.com");
+    expect(body.ingress.some((i) => i.app === name)).toBe(true);
+    expect(
+      body.ingress.find((i) => i.app === name)?.hostname,
+    ).toBe(`${name}.example.com`);
+    expect(
+      body.ingress.find((i) => i.app === name)?.service,
+    ).toBe("http://localhost:5678");
+  });
+
+  it("stops an app by enqueueing docker.rm and marking deployments STOPPED", async () => {
+    const reg = await request(
+      "/v1/nodes/register",
+      {
+        method: "POST",
+        body: JSON.stringify({ name: `st-${crypto.randomUUID().slice(0, 6)}` }),
+      },
+      OP(),
+    );
+    const { node, token } = await reg.json<{
+      node: { id: string };
+      token: string;
+    }>();
+
+    const name = `stop-${crypto.randomUUID().slice(0, 8)}`;
+    await request(
+      "/v1/apps",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          name,
+          runtime: "docker",
+          source: { type: "image", image: "hashicorp/http-echo:1.0.0" },
+          network: { public: false, port: 5678 },
+        }),
+      },
+      OP(),
+    );
+
+    const deploy = await request(
+      `/v1/apps/${name}/deploy`,
+      { method: "POST", body: "{}" },
+      OP(),
+    );
+    const deployBody = await deploy.json<{
+      job: { id: string };
+      deployment: { id: string };
+    }>();
+
+    await request("/v1/nodes/me/jobs/next", {}, token);
+    await request(`/v1/jobs/${deployBody.job.id}/start`, { method: "POST", body: "{}" }, token);
+    await request(
+      `/v1/jobs/${deployBody.job.id}/complete`,
+      { method: "POST", body: JSON.stringify({ result: { ok: true } }) },
+      token,
+    );
+
+    const stop = await request(
+      `/v1/apps/${name}/stop`,
+      { method: "POST", body: "{}" },
+      OP(),
+    );
+    expect(stop.status).toBe(201);
+    const stopBody = await stop.json<{
+      stoppedNodes: number;
+      jobs: Array<{ type: string; nodeId: string; payloadJson: string }>;
+    }>();
+    expect(stopBody.stoppedNodes).toBe(1);
+    expect(stopBody.jobs[0]?.type).toBe("docker.rm");
+    expect(stopBody.jobs[0]?.nodeId).toBe(node.id);
+    expect(JSON.parse(stopBody.jobs[0]!.payloadJson)).toEqual({
+      name: `omc-${name}`,
+    });
+
+    const deps = await request(`/v1/apps/${name}/deployments`, {}, OP());
+    const depsBody = await deps.json<{
+      deployments: Array<{ status: string }>;
+    }>();
+    expect(depsBody.deployments.every((d) => d.status === "STOPPED")).toBe(
+      true,
+    );
+  });
+
+  it("queues docker.logs for a succeeded deployment", async () => {
+    const reg = await request(
+      "/v1/nodes/register",
+      {
+        method: "POST",
+        body: JSON.stringify({ name: `lg-${crypto.randomUUID().slice(0, 6)}` }),
+      },
+      OP(),
+    );
+    const { token } = await reg.json<{ token: string }>();
+
+    const name = `logs-${crypto.randomUUID().slice(0, 8)}`;
+    await request(
+      "/v1/apps",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          name,
+          runtime: "docker",
+          source: { type: "image", image: "hashicorp/http-echo:1.0.0" },
+        }),
+      },
+      OP(),
+    );
+    const deploy = await request(
+      `/v1/apps/${name}/deploy`,
+      { method: "POST", body: "{}" },
+      OP(),
+    );
+    const deployBody = await deploy.json<{ job: { id: string } }>();
+    await request("/v1/nodes/me/jobs/next", {}, token);
+    await request(`/v1/jobs/${deployBody.job.id}/start`, { method: "POST", body: "{}" }, token);
+    await request(
+      `/v1/jobs/${deployBody.job.id}/complete`,
+      { method: "POST", body: JSON.stringify({ result: {} }) },
+      token,
+    );
+
+    const logs = await request(
+      `/v1/apps/${name}/logs`,
+      { method: "POST", body: JSON.stringify({ tail: 50 }) },
+      OP(),
+    );
+    expect(logs.status).toBe(201);
+    const logsBody = await logs.json<{
+      job: { type: string; payloadJson: string; status: string };
+    }>();
+    expect(logsBody.job.type).toBe("docker.logs");
+    expect(logsBody.job.status).toBe("QUEUED");
+    expect(JSON.parse(logsBody.job.payloadJson)).toEqual({
+      name: `omc-${name}`,
+      tail: 50,
+    });
   });
 
   it("fans out deploy jobs to every ONLINE node", async () => {
