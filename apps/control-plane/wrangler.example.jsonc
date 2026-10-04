@@ -1,0 +1,24 @@
+{
+  "name": "onemancloud-control-plane",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-09-06",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true,
+    "traces": {
+      "enabled": true
+    }
+  },
+  "vars": {
+    "HEARTBEAT_TIMEOUT_SECONDS": "90",
+    "BASE_DOMAIN": "example.com"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "onemancloud",
+      "database_id": "REPLACE_WITH_YOUR_D1_DATABASE_ID",
+      "migrations_dir": "../../database/migrations"
+    }
+  ]
+}

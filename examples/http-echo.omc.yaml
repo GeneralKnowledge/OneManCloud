@@ -1,0 +1,13 @@
+name: http-echo
+runtime: docker
+source:
+  type: image
+  image: hashicorp/http-echo:1.0.0
+  args: ["-text=hello from onemancloud", "-listen=:5678"]
+compute:
+  memory: 128mb
+  cpu: 1
+network:
+  public: true
+  port: 5678
+sleep: false
