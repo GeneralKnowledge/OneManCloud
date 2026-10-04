@@ -11,4 +11,3 @@ coverage/
 *.tsbuildinfo
 .omc/
 apps/control-plane/.wrangler/
-apps/control-plane/worker-configuration.d.ts
