@@ -67,6 +67,14 @@ Applications
 Queued Jobs      0
 ```
 
+## Failover apps (still free)
+
+`omc deploy` places a container on **every ONLINE node**. Expose them with
+**Cloudflare Tunnel replicas** (same tunnel on each machine) so if Oracle or
+your home PC dies, traffic fails over without paid Load Balancing.
+
+See [docs/tunnel.md](docs/tunnel.md).
+
 ## Local mode (with a compute node)
 
 ```bash

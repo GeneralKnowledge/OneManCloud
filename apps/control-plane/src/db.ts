@@ -52,6 +52,7 @@ export interface AppRow {
   cpu: number;
   public: number;
   sleep: number;
+  port: number | null;
   created_at: number;
   updated_at: number;
 }
@@ -113,6 +114,7 @@ export function mapApp(row: AppRow): ApplicationRecord & { sourceArgsJson: strin
     cpu: row.cpu,
     public: row.public === 1,
     sleep: row.sleep === 1,
+    port: row.port ?? null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     sourceArgsJson: row.source_args_json,

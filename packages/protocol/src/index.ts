@@ -143,6 +143,7 @@ export interface ApplicationRecord {
   cpu: number;
   public: boolean;
   sleep: boolean;
+  port: number | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -162,6 +163,8 @@ export interface ApplicationConfig {
   };
   network?: {
     public?: boolean;
+    /** Container port; published on the same host port for Tunnel replicas. */
+    port?: number;
   };
   sleep?: boolean;
 }

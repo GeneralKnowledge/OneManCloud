@@ -358,7 +358,7 @@ describe("applications", () => {
           runtime: "docker",
           source: { type: "image", image: "hashicorp/http-echo:1.0.0" },
           compute: { memory: "128mb", cpu: 1 },
-          network: { public: true },
+          network: { public: true, port: 5678 },
           sleep: false,
         }),
       },
@@ -373,12 +373,80 @@ describe("applications", () => {
     );
     expect(deploy.status).toBe(201);
     const body = await deploy.json<{
+      mode: string;
+      targetNodes: number;
       job: { status: string; type: string };
       deployment: { status: string; publicUrl: string | null };
+      jobs: unknown[];
     }>();
+    expect(body.mode).toBe("failover");
+    expect(body.targetNodes).toBe(0);
     expect(body.job.status).toBe("QUEUED");
     expect(body.job.type).toBe("deploy");
     expect(body.deployment.status).toBe("PENDING");
     expect(body.deployment.publicUrl).toContain(name);
+    expect(body.jobs).toHaveLength(1);
+  });
+
+  it("fans out deploy jobs to every ONLINE node", async () => {
+    const a = await request(
+      "/v1/nodes/register",
+      {
+        method: "POST",
+        body: JSON.stringify({ name: `fa-${crypto.randomUUID().slice(0, 6)}` }),
+      },
+      OP(),
+    );
+    const b = await request(
+      "/v1/nodes/register",
+      {
+        method: "POST",
+        body: JSON.stringify({ name: `fb-${crypto.randomUUID().slice(0, 6)}` }),
+      },
+      OP(),
+    );
+    const nodeA = await a.json<{ node: { id: string }; token: string }>();
+    const nodeB = await b.json<{ node: { id: string }; token: string }>();
+
+    const name = `multi-${crypto.randomUUID().slice(0, 8)}`;
+    await request(
+      "/v1/apps",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          name,
+          runtime: "docker",
+          source: { type: "image", image: "hashicorp/http-echo:1.0.0" },
+          network: { public: true, port: 5678 },
+        }),
+      },
+      OP(),
+    );
+
+    const deploy = await request(
+      `/v1/apps/${name}/deploy`,
+      { method: "POST", body: "{}" },
+      OP(),
+    );
+    const body = await deploy.json<{
+      targetNodes: number;
+      jobs: Array<{ id: string; nodeId: string | null; status: string }>;
+      publishPort: string;
+    }>();
+    expect(body.targetNodes).toBe(2);
+    expect(body.jobs).toHaveLength(2);
+    expect(body.publishPort).toBe("5678:5678");
+    const nodeIds = new Set(body.jobs.map((j) => j.nodeId));
+    expect(nodeIds.has(nodeA.node.id)).toBe(true);
+    expect(nodeIds.has(nodeB.node.id)).toBe(true);
+
+    const nextA = await request("/v1/nodes/me/jobs/next", {}, nodeA.token);
+    const claimA = await nextA.json<{ job: { id: string; nodeId: string } }>();
+    expect(claimA.job.nodeId).toBe(nodeA.node.id);
+
+    const nextB = await request("/v1/nodes/me/jobs/next", {}, nodeB.token);
+    const claimB = await nextB.json<{ job: { id: string; nodeId: string } }>();
+    expect(claimB.job.nodeId).toBe(nodeB.node.id);
+    expect(claimA.job.id).not.toBe(claimB.job.id);
   });
 });

@@ -49,20 +49,31 @@ statusRoutes.get("/v1/status", requireOperator, async (c) => {
     `SELECT COUNT(*) as count FROM jobs WHERE status = 'QUEUED'`,
   ).first<{ count: number }>();
 
-  const latestDeployments = await c.env.DB.prepare(
-    `SELECT d.application_id as application_id, d.status as status
-     FROM deployments d
-     INNER JOIN (
-       SELECT application_id, MAX(created_at) as max_created
-       FROM deployments
-       GROUP BY application_id
-     ) latest ON latest.application_id = d.application_id
-            AND latest.max_created = d.created_at`,
-  ).all<{ application_id: string; status: string }>();
+  const latestWave = await c.env.DB.prepare(
+    `SELECT application_id, MAX(created_at) as max_created
+     FROM deployments
+     GROUP BY application_id`,
+  ).all<{ application_id: string; max_created: number }>();
 
-  const deployByApp = new Map(
-    (latestDeployments.results ?? []).map((d) => [d.application_id, d.status]),
-  );
+  const deployByApp = new Map<string, string>();
+  for (const wave of latestWave.results ?? []) {
+    const rows = await c.env.DB.prepare(
+      `SELECT status FROM deployments
+       WHERE application_id = ? AND created_at = ?`,
+    )
+      .bind(wave.application_id, wave.max_created)
+      .all<{ status: string }>();
+    const statuses = (rows.results ?? []).map((r) => r.status);
+    if (statuses.some((s) => s === "SUCCEEDED")) {
+      deployByApp.set(wave.application_id, "RUNNING");
+    } else if (statuses.some((s) => s === "PENDING")) {
+      deployByApp.set(wave.application_id, "PENDING");
+    } else if (statuses.some((s) => s === "FAILED")) {
+      deployByApp.set(wave.application_id, "FAILED");
+    } else {
+      deployByApp.set(wave.application_id, statuses[0] ?? "STOPPED");
+    }
+  }
 
   const body: StatusResponse = {
     name: "OneManCloud",

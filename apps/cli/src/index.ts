@@ -197,15 +197,38 @@ async function cmdDeploy(args: string[]): Promise<void> {
   const name = args[0];
   if (!name) throw new Error("Usage: omc deploy <app-name>");
   const body = await api<{
+    mode?: string;
+    targetNodes?: number;
+    publicUrl?: string | null;
+    publishPort?: string;
+    tunnelHint?: string;
     deployment: { id: string; status: string; publicUrl: string | null };
     job: JobRecord;
+    deployments?: Array<{ id: string; status: string; nodeId: string | null }>;
+    jobs?: JobRecord[];
   }>("POST", `/v1/apps/${name}/deploy`, {});
-  console.log(`Deployment ${body.deployment.id}  ${body.deployment.status}`);
-  console.log(`Job        ${body.job.id}  ${body.job.status}`);
-  if (body.deployment.publicUrl) {
-    console.log(`Public URL ${body.deployment.publicUrl}`);
+  console.log(`Mode       ${body.mode ?? "single"}`);
+  console.log(`Targets    ${body.targetNodes ?? 1} ONLINE node(s)`);
+  for (const dep of body.deployments ?? [body.deployment]) {
     console.log(
-      "(Expose via Cloudflare Tunnel on the node — see omc tunnel)",
+      `Deployment ${dep.id}  ${dep.status}  node=${"nodeId" in dep ? dep.nodeId ?? "(any)" : "-"}`,
+    );
+  }
+  for (const job of body.jobs ?? [body.job]) {
+    console.log(`Job        ${job.id}  ${job.status}  node=${job.nodeId ?? "(any)"}`);
+  }
+  if (body.publishPort) {
+    console.log(`Publish    ${body.publishPort}`);
+  }
+  const url = body.publicUrl ?? body.deployment.publicUrl;
+  if (url) {
+    console.log(`Public URL ${url}`);
+  }
+  if (body.tunnelHint) {
+    console.log(body.tunnelHint);
+  } else {
+    console.log(
+      "(Expose via Cloudflare Tunnel replicas — see omc tunnel / docs/tunnel.md)",
     );
   }
 }

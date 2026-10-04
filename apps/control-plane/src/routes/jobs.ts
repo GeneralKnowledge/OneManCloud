@@ -81,9 +81,22 @@ jobRoutes.get("/v1/nodes/me/jobs/next", requireNode, async (c) => {
   const nodeId = c.get("nodeId")!;
   const now = Date.now();
 
-  const queued = await c.env.DB.prepare(
-    `SELECT * FROM jobs WHERE status = 'QUEUED' ORDER BY created_at ASC LIMIT 1`,
-  ).first<JobRow>();
+  // Prefer jobs pre-assigned to this node (failover fan-out), then unassigned.
+  let queued = await c.env.DB.prepare(
+    `SELECT * FROM jobs
+     WHERE status = 'QUEUED' AND node_id = ?
+     ORDER BY created_at ASC LIMIT 1`,
+  )
+    .bind(nodeId)
+    .first<JobRow>();
+
+  if (!queued) {
+    queued = await c.env.DB.prepare(
+      `SELECT * FROM jobs
+       WHERE status = 'QUEUED' AND node_id IS NULL
+       ORDER BY created_at ASC LIMIT 1`,
+    ).first<JobRow>();
+  }
 
   if (!queued) {
     return c.json({ job: null });
@@ -92,13 +105,14 @@ jobRoutes.get("/v1/nodes/me/jobs/next", requireNode, async (c) => {
   const updated = await c.env.DB.prepare(
     `UPDATE jobs
      SET status = 'DISPATCHED',
-         node_id = ?,
+         node_id = COALESCE(node_id, ?),
          attempts = attempts + 1,
          updated_at = ?,
          started_at = ?
-     WHERE id = ? AND status = 'QUEUED'`,
+     WHERE id = ? AND status = 'QUEUED'
+       AND (node_id IS NULL OR node_id = ?)`,
   )
-    .bind(nodeId, now, now, queued.id)
+    .bind(nodeId, now, now, queued.id, nodeId)
     .run();
 
   if (!updated.meta.changes) {
@@ -193,30 +207,48 @@ jobRoutes.post("/v1/jobs/:id/complete", requireNode, async (c) => {
     .run();
 
   if (row.application_id && row.type === "deploy") {
-    await c.env.DB.prepare(
-      `UPDATE deployments
-       SET status = 'SUCCEEDED',
-           node_id = ?,
-           public_url = ?,
-           updated_at = ?
-       WHERE application_id = ?
-         AND id = (
-           SELECT id FROM deployments
-           WHERE application_id = ?
-           ORDER BY created_at DESC LIMIT 1
-         )`,
-    )
-      .bind(
-        nodeId,
-        (body.result?.publicUrl as string | undefined) ?? null,
-        now,
-        row.application_id,
-        row.application_id,
+    const payload = JSON.parse(row.payload_json) as {
+      deploymentId?: string;
+      publicUrl?: string | null;
+    };
+    const publicUrl =
+      (body.result?.publicUrl as string | undefined) ??
+      payload.publicUrl ??
+      null;
+
+    if (payload.deploymentId) {
+      await c.env.DB.prepare(
+        `UPDATE deployments
+         SET status = 'SUCCEEDED',
+             node_id = ?,
+             public_url = COALESCE(?, public_url),
+             updated_at = ?
+         WHERE id = ?`,
       )
-      .run();
+        .bind(nodeId, publicUrl, now, payload.deploymentId)
+        .run();
+    } else {
+      await c.env.DB.prepare(
+        `UPDATE deployments
+         SET status = 'SUCCEEDED',
+             node_id = ?,
+             public_url = ?,
+             updated_at = ?
+         WHERE application_id = ?
+           AND id = (
+             SELECT id FROM deployments
+             WHERE application_id = ?
+             ORDER BY created_at DESC LIMIT 1
+           )`,
+      )
+        .bind(nodeId, publicUrl, now, row.application_id, row.application_id)
+        .run();
+    }
     structuredLog("DEPLOYMENT_SUCCEEDED", {
       applicationId: row.application_id,
+      deploymentId: payload.deploymentId,
       jobId,
+      nodeId,
     });
   }
 
@@ -241,10 +273,10 @@ jobRoutes.post("/v1/jobs/:id/fail", requireNode, async (c) => {
     body.retry !== false && row.attempts < row.max_attempts;
 
   if (shouldRetry) {
+    // Keep node affinity for failover replicas so the same node retries.
     await c.env.DB.prepare(
       `UPDATE jobs
        SET status = 'QUEUED',
-           node_id = NULL,
            result_json = ?,
            updated_at = ?,
            started_at = NULL
@@ -270,20 +302,34 @@ jobRoutes.post("/v1/jobs/:id/fail", requireNode, async (c) => {
       .run();
 
     if (row.application_id && row.type === "deploy") {
-      await c.env.DB.prepare(
-        `UPDATE deployments
-         SET status = 'FAILED', updated_at = ?
-         WHERE application_id = ?
-           AND id = (
-             SELECT id FROM deployments
-             WHERE application_id = ?
-             ORDER BY created_at DESC LIMIT 1
-           )`,
-      )
-        .bind(now, row.application_id, row.application_id)
-        .run();
+      const payload = JSON.parse(row.payload_json) as {
+        deploymentId?: string;
+      };
+      if (payload.deploymentId) {
+        await c.env.DB.prepare(
+          `UPDATE deployments
+           SET status = 'FAILED', updated_at = ?
+           WHERE id = ?`,
+        )
+          .bind(now, payload.deploymentId)
+          .run();
+      } else {
+        await c.env.DB.prepare(
+          `UPDATE deployments
+           SET status = 'FAILED', updated_at = ?
+           WHERE application_id = ?
+             AND id = (
+               SELECT id FROM deployments
+               WHERE application_id = ?
+               ORDER BY created_at DESC LIMIT 1
+             )`,
+        )
+          .bind(now, row.application_id, row.application_id)
+          .run();
+      }
       structuredLog("DEPLOYMENT_FAILED", {
         applicationId: row.application_id,
+        deploymentId: payload.deploymentId,
         jobId,
       });
     }

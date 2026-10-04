@@ -46,6 +46,7 @@ appRoutes.post("/v1/apps", requireOperator, async (c) => {
   const cpu = body.compute?.cpu ?? 1;
   const isPublic = body.network?.public ?? false;
   const sleep = body.sleep ?? true;
+  const port = body.network?.port ?? null;
   const argsJson = JSON.stringify(body.source.args ?? []);
 
   let id: string;
@@ -62,6 +63,7 @@ appRoutes.post("/v1/apps", requireOperator, async (c) => {
            cpu = ?,
            public = ?,
            sleep = ?,
+           port = ?,
            updated_at = ?
        WHERE id = ?`,
     )
@@ -75,6 +77,7 @@ appRoutes.post("/v1/apps", requireOperator, async (c) => {
         cpu,
         isPublic ? 1 : 0,
         sleep ? 1 : 0,
+        port,
         now,
         id,
       )
@@ -84,8 +87,8 @@ appRoutes.post("/v1/apps", requireOperator, async (c) => {
     await c.env.DB.prepare(
       `INSERT INTO applications (
          id, name, runtime, source_type, source_repo, source_image, source_args_json,
-         memory_mb, cpu, public, sleep, created_at, updated_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         memory_mb, cpu, public, sleep, port, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
       .bind(
         id,
@@ -99,6 +102,7 @@ appRoutes.post("/v1/apps", requireOperator, async (c) => {
         cpu,
         isPublic ? 1 : 0,
         sleep ? 1 : 0,
+        port,
         now,
         now,
       )
@@ -141,8 +145,6 @@ appRoutes.post("/v1/apps/:name/deploy", requireOperator, async (c) => {
 
   const app = mapApp(row);
   const now = Date.now();
-  const deploymentId = newId("dep");
-  const jobId = newId("job");
 
   let publicUrl: string | null = null;
   if (app.public) {
@@ -155,59 +157,113 @@ appRoutes.post("/v1/apps/:name/deploy", requireOperator, async (c) => {
     }
   }
 
-  await c.env.DB.prepare(
-    `INSERT INTO deployments (
-       id, application_id, node_id, status, public_url, created_at, updated_at
-     ) VALUES (?, ?, NULL, 'PENDING', ?, ?, ?)`,
-  )
-    .bind(deploymentId, app.id, publicUrl, now, now)
-    .run();
+  // Failover-style: one replica on every currently ONLINE node.
+  // Routing uses free Cloudflare Tunnel replicas (same tunnel on each host).
+  const online = await c.env.DB.prepare(
+    `SELECT id, name FROM nodes WHERE status = 'ONLINE' ORDER BY name ASC`,
+  ).all<{ id: string; name: string }>();
+  const targets = online.results ?? [];
 
-  const payload = {
-    deploymentId,
-    applicationId: app.id,
-    name: app.name,
-    runtime: app.runtime,
-    sourceType: app.sourceType,
-    sourceRepo: app.sourceRepo,
-    sourceImage: app.sourceImage,
-    sourceArgs: JSON.parse(app.sourceArgsJson ?? "[]") as string[],
-    memoryMb: app.memoryMb,
-    cpu: app.cpu,
-    public: app.public,
-    sleep: app.sleep,
-    publicUrl,
+  const containerPort = app.port ?? 8080;
+  const publishPort = `${containerPort}:${containerPort}`;
+
+  type Created = {
+    deploymentId: string;
+    jobId: string;
+    nodeId: string | null;
   };
+  const created: Created[] = [];
 
-  await c.env.DB.prepare(
-    `INSERT INTO jobs (
-       id, type, application_id, node_id, status, payload_json, result_json,
-       attempts, max_attempts, created_at, updated_at, started_at, finished_at
-     ) VALUES (?, 'deploy', ?, NULL, 'QUEUED', ?, NULL, 0, 3, ?, ?, NULL, NULL)`,
-  )
-    .bind(jobId, app.id, JSON.stringify(payload), now, now)
-    .run();
+  const targetsOrUnassigned: Array<{ id: string | null; name: string | null }> =
+    targets.length > 0
+      ? targets.map((t) => ({ id: t.id, name: t.name }))
+      : [{ id: null, name: null }];
 
-  structuredLog("DEPLOYMENT_STARTED", {
-    deploymentId,
-    applicationId: app.id,
-    jobId,
-  });
-  structuredLog("JOB_CREATED", { jobId, type: "deploy" });
+  for (const target of targetsOrUnassigned) {
+    const deploymentId = newId("dep");
+    const jobId = newId("job");
+    await c.env.DB.prepare(
+      `INSERT INTO deployments (
+         id, application_id, node_id, status, public_url, created_at, updated_at
+       ) VALUES (?, ?, ?, 'PENDING', ?, ?, ?)`,
+    )
+      .bind(deploymentId, app.id, target.id, publicUrl, now, now)
+      .run();
 
-  const deployment = await c.env.DB.prepare(
-    `SELECT * FROM deployments WHERE id = ?`,
-  )
-    .bind(deploymentId)
-    .first<DeploymentRow>();
-  const job = await c.env.DB.prepare(`SELECT * FROM jobs WHERE id = ?`)
-    .bind(jobId)
-    .first<JobRow>();
+    const payload = {
+      deploymentId,
+      applicationId: app.id,
+      name: app.name,
+      runtime: app.runtime,
+      sourceType: app.sourceType,
+      sourceRepo: app.sourceRepo,
+      sourceImage: app.sourceImage,
+      sourceArgs: JSON.parse(app.sourceArgsJson ?? "[]") as string[],
+      memoryMb: app.memoryMb,
+      cpu: app.cpu,
+      public: app.public,
+      sleep: app.sleep,
+      publicUrl,
+      publishPort,
+      containerPort,
+      failover: true,
+    };
+
+    await c.env.DB.prepare(
+      `INSERT INTO jobs (
+         id, type, application_id, node_id, status, payload_json, result_json,
+         attempts, max_attempts, created_at, updated_at, started_at, finished_at
+       ) VALUES (?, 'deploy', ?, ?, 'QUEUED', ?, NULL, 0, 3, ?, ?, NULL, NULL)`,
+    )
+      .bind(jobId, app.id, target.id, JSON.stringify(payload), now, now)
+      .run();
+
+    structuredLog("DEPLOYMENT_STARTED", {
+      deploymentId,
+      applicationId: app.id,
+      jobId,
+      nodeId: target.id,
+      nodeName: target.name,
+    });
+    structuredLog("JOB_CREATED", {
+      jobId,
+      type: "deploy",
+      nodeId: target.id,
+    });
+    created.push({ deploymentId, jobId, nodeId: target.id });
+  }
+
+  const deployments = [];
+  const jobs = [];
+  for (const item of created) {
+    const deployment = await c.env.DB.prepare(
+      `SELECT * FROM deployments WHERE id = ?`,
+    )
+      .bind(item.deploymentId)
+      .first<DeploymentRow>();
+    const job = await c.env.DB.prepare(`SELECT * FROM jobs WHERE id = ?`)
+      .bind(item.jobId)
+      .first<JobRow>();
+    deployments.push(mapDeployment(deployment!));
+    jobs.push(mapJob(job!));
+  }
 
   return c.json(
     {
-      deployment: mapDeployment(deployment!),
-      job: mapJob(job!),
+      mode: "failover",
+      targetNodes: targets.length,
+      publicUrl,
+      publishPort,
+      tunnelHint:
+        targets.length > 1
+          ? "Run the same Cloudflare Tunnel (replicas) on each node, pointing at localhost:" +
+            String(containerPort)
+          : "When multiple nodes are ONLINE, redeploy to place a replica on each; use Tunnel replicas for free failover.",
+      // Back-compat for older CLI: first deployment/job
+      deployment: deployments[0],
+      job: jobs[0],
+      deployments,
+      jobs,
     },
     201,
   );
@@ -238,8 +294,10 @@ appRoutes.get("/v1/tunnel", requireOperator, async (c) => {
   const tunnelToken = await getConfigValue(c.env.DB, "tunnel_token_set");
   return c.json({
     model: {
-      preferred: "cloudflare-tunnel",
+      preferred: "cloudflare-tunnel-replicas",
+      mode: "failover",
       requiredForInternalJobs: false,
+      cost: "free-tier-friendly",
       baseDomain,
       hostnames: baseDomain
         ? {
@@ -250,10 +308,12 @@ appRoutes.get("/v1/tunnel", requireOperator, async (c) => {
         : null,
       tunnelConfigured: tunnelToken === "true",
       manualSetup: [
-        "Install cloudflared on the compute node",
-        "Create a Cloudflare Tunnel in Zero Trust",
-        "Route app.<base-domain> (or *.base) to localhost:<container-port>",
-        "Store tunnel notes via: omc config set tunnel_notes '...'",
+        "Create one Cloudflare Tunnel in Zero Trust (free)",
+        "Install cloudflared on EVERY compute node and run the SAME tunnel (replicas)",
+        "Route app.<base-domain> → http://localhost:<app-port> (same port on each node)",
+        "omc deploy places a container replica on each ONLINE node",
+        "If one node dies, Cloudflare serves another healthy tunnel replica",
+        "Store notes via: omc config set tunnel_notes '...'",
       ],
     },
   });

@@ -146,6 +146,11 @@ async function deployApp(
       image,
       name: containerName,
       args: sourceArgs,
+      publishPort:
+        (payload.publishPort as string | undefined) ??
+        (payload.containerPort
+          ? `${payload.containerPort}:${payload.containerPort}`
+          : undefined),
     },
     onLog,
   );
@@ -158,6 +163,11 @@ async function deployApp(
     containerName,
   ]);
   await onLog([`ports: ${inspect.stdout.trim()}`]);
+  if (payload.publishPort || payload.containerPort) {
+    await onLog([
+      `Tunnel replica target: http://localhost:${String(payload.containerPort ?? payload.publishPort)}`,
+    ]);
+  }
 
   return {
     ...result,

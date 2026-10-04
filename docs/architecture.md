@@ -55,6 +55,12 @@ VPS) only need the same protocol.
 Coolify/Dokploy run the control plane on the VPS. OneManCloud runs the control
 plane on Cloudflare so the platform survives node loss.
 
+## Failover (free)
+
+`omc deploy` fans out one replica job per ONLINE node. Public routing uses
+Cloudflare Tunnel **replicas** (same tunnel UUID on each host) — free failover,
+not paid Load Balancing. See `docs/tunnel.md`.
+
 ## Security
 
 - Single operator Bearer token (`OPERATOR_TOKEN` secret).
