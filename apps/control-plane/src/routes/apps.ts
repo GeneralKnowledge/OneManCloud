@@ -20,6 +20,18 @@ import {
 
 export const appRoutes = new Hono<AppEnv>();
 
+function normalizeEnv(
+  env: Record<string, string> | undefined,
+): Record<string, string> {
+  if (!env || typeof env !== "object") return {};
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(env)) {
+    if (!k.trim()) continue;
+    out[k] = typeof v === "string" ? v : String(v);
+  }
+  return out;
+}
+
 appRoutes.post("/v1/apps", requireOperator, async (c) => {
   const body = await c.req.json<ApplicationConfig>();
   if (!body.name || body.runtime !== "docker") {
@@ -45,9 +57,9 @@ appRoutes.post("/v1/apps", requireOperator, async (c) => {
   const memoryMb = parseMemoryMb(body.compute?.memory);
   const cpu = body.compute?.cpu ?? 1;
   const isPublic = body.network?.public ?? false;
-  const sleep = body.sleep ?? true;
   const port = body.network?.port ?? null;
   const argsJson = JSON.stringify(body.source.args ?? []);
+  const envJson = JSON.stringify(normalizeEnv(body.env));
 
   let id: string;
   if (existing) {
@@ -62,8 +74,9 @@ appRoutes.post("/v1/apps", requireOperator, async (c) => {
            memory_mb = ?,
            cpu = ?,
            public = ?,
-           sleep = ?,
+           sleep = 0,
            port = ?,
+           env_json = ?,
            updated_at = ?
        WHERE id = ?`,
     )
@@ -76,8 +89,8 @@ appRoutes.post("/v1/apps", requireOperator, async (c) => {
         memoryMb,
         cpu,
         isPublic ? 1 : 0,
-        sleep ? 1 : 0,
         port,
+        envJson,
         now,
         id,
       )
@@ -87,8 +100,8 @@ appRoutes.post("/v1/apps", requireOperator, async (c) => {
     await c.env.DB.prepare(
       `INSERT INTO applications (
          id, name, runtime, source_type, source_repo, source_image, source_args_json,
-         memory_mb, cpu, public, sleep, port, created_at, updated_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         memory_mb, cpu, public, sleep, port, env_json, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)`,
     )
       .bind(
         id,
@@ -101,8 +114,8 @@ appRoutes.post("/v1/apps", requireOperator, async (c) => {
         memoryMb,
         cpu,
         isPublic ? 1 : 0,
-        sleep ? 1 : 0,
         port,
+        envJson,
         now,
         now,
       )
@@ -158,7 +171,6 @@ appRoutes.post("/v1/apps/:name/deploy", requireOperator, async (c) => {
   }
 
   // Failover-style: one replica on every currently ONLINE node.
-  // Routing uses free Cloudflare Tunnel replicas (same tunnel on each host).
   const online = await c.env.DB.prepare(
     `SELECT id, name FROM nodes WHERE status = 'ONLINE' ORDER BY name ASC`,
   ).all<{ id: string; name: string }>();
@@ -201,8 +213,8 @@ appRoutes.post("/v1/apps/:name/deploy", requireOperator, async (c) => {
       sourceArgs: JSON.parse(app.sourceArgsJson ?? "[]") as string[],
       memoryMb: app.memoryMb,
       cpu: app.cpu,
+      env: app.env,
       public: app.public,
-      sleep: app.sleep,
       publicUrl,
       publishPort,
       containerPort,
@@ -259,7 +271,6 @@ appRoutes.post("/v1/apps/:name/deploy", requireOperator, async (c) => {
           ? "Run the same Cloudflare Tunnel (replicas) on each node, pointing at localhost:" +
             String(containerPort)
           : "When multiple nodes are ONLINE, redeploy to place a replica on each; use Tunnel replicas for free failover.",
-      // Back-compat for older CLI: first deployment/job
       deployment: deployments[0],
       job: jobs[0],
       deployments,
@@ -267,6 +278,131 @@ appRoutes.post("/v1/apps/:name/deploy", requireOperator, async (c) => {
     },
     201,
   );
+});
+
+appRoutes.post("/v1/apps/:name/stop", requireOperator, async (c) => {
+  const row = await c.env.DB.prepare(
+    `SELECT * FROM applications WHERE name = ? OR id = ?`,
+  )
+    .bind(c.req.param("name"), c.req.param("name"))
+    .first<AppRow>();
+  if (!row) return c.json({ error: "Application not found" }, 404);
+
+  const app = mapApp(row);
+  const now = Date.now();
+  const containerName = `omc-${app.name}`;
+
+  const active = await c.env.DB.prepare(
+    `SELECT DISTINCT node_id FROM deployments
+     WHERE application_id = ?
+       AND status IN ('PENDING', 'RUNNING', 'SUCCEEDED')
+       AND node_id IS NOT NULL`,
+  )
+    .bind(app.id)
+    .all<{ node_id: string }>();
+
+  const nodeIds = (active.results ?? []).map((r) => r.node_id);
+  const createdJobs = [];
+
+  for (const nodeId of nodeIds) {
+    const jobId = newId("job");
+    const payload = { name: containerName };
+    await c.env.DB.prepare(
+      `INSERT INTO jobs (
+         id, type, application_id, node_id, status, payload_json, result_json,
+         attempts, max_attempts, created_at, updated_at, started_at, finished_at
+       ) VALUES (?, 'docker.rm', ?, ?, 'QUEUED', ?, NULL, 0, 3, ?, ?, NULL, NULL)`,
+    )
+      .bind(jobId, app.id, nodeId, JSON.stringify(payload), now, now)
+      .run();
+    structuredLog("JOB_CREATED", {
+      jobId,
+      type: "docker.rm",
+      nodeId,
+      applicationId: app.id,
+    });
+    const job = await c.env.DB.prepare(`SELECT * FROM jobs WHERE id = ?`)
+      .bind(jobId)
+      .first<JobRow>();
+    createdJobs.push(mapJob(job!));
+  }
+
+  await c.env.DB.prepare(
+    `UPDATE deployments
+     SET status = 'STOPPED', updated_at = ?
+     WHERE application_id = ?
+       AND status IN ('PENDING', 'RUNNING', 'SUCCEEDED')`,
+  )
+    .bind(now, app.id)
+    .run();
+
+  return c.json(
+    {
+      applicationId: app.id,
+      name: app.name,
+      stoppedNodes: nodeIds.length,
+      jobs: createdJobs,
+    },
+    201,
+  );
+});
+
+appRoutes.post("/v1/apps/:name/logs", requireOperator, async (c) => {
+  const row = await c.env.DB.prepare(
+    `SELECT * FROM applications WHERE name = ? OR id = ?`,
+  )
+    .bind(c.req.param("name"), c.req.param("name"))
+    .first<AppRow>();
+  if (!row) return c.json({ error: "Application not found" }, 404);
+
+  const app = mapApp(row);
+  const body = await c.req.json<{ tail?: number }>().catch(() => ({} as { tail?: number }));
+  const tail =
+    typeof body.tail === "number" && body.tail > 0 && body.tail <= 5000
+      ? Math.floor(body.tail)
+      : 100;
+
+  const deployment = await c.env.DB.prepare(
+    `SELECT node_id FROM deployments
+     WHERE application_id = ?
+       AND status = 'SUCCEEDED'
+       AND node_id IS NOT NULL
+     ORDER BY created_at DESC
+     LIMIT 1`,
+  )
+    .bind(app.id)
+    .first<{ node_id: string }>();
+
+  if (!deployment?.node_id) {
+    return c.json(
+      { error: "No SUCCEEDED deployment with an assigned node" },
+      404,
+    );
+  }
+
+  const now = Date.now();
+  const jobId = newId("job");
+  const payload = { name: `omc-${app.name}`, tail };
+  await c.env.DB.prepare(
+    `INSERT INTO jobs (
+       id, type, application_id, node_id, status, payload_json, result_json,
+       attempts, max_attempts, created_at, updated_at, started_at, finished_at
+     ) VALUES (?, 'docker.logs', ?, ?, 'QUEUED', ?, NULL, 0, 1, ?, ?, NULL, NULL)`,
+  )
+    .bind(jobId, app.id, deployment.node_id, JSON.stringify(payload), now, now)
+    .run();
+
+  structuredLog("JOB_CREATED", {
+    jobId,
+    type: "docker.logs",
+    nodeId: deployment.node_id,
+    applicationId: app.id,
+  });
+
+  const job = await c.env.DB.prepare(`SELECT * FROM jobs WHERE id = ?`)
+    .bind(jobId)
+    .first<JobRow>();
+  return c.json({ job: mapJob(job!), nodeId: deployment.node_id }, 201);
 });
 
 appRoutes.get("/v1/apps/:name/deployments", requireOperator, async (c) => {
@@ -291,30 +427,32 @@ appRoutes.get("/v1/tunnel", requireOperator, async (c) => {
     (await getConfigValue(c.env.DB, "base_domain")) ||
     c.env.BASE_DOMAIN ||
     null;
-  const tunnelToken = await getConfigValue(c.env.DB, "tunnel_token_set");
+
+  const apps = await c.env.DB.prepare(
+    `SELECT name, port, public FROM applications
+     WHERE public = 1
+     ORDER BY name ASC`,
+  ).all<{ name: string; port: number | null; public: number }>();
+
+  const ingress = (apps.results ?? [])
+    .filter((a) => baseDomain && a.port != null)
+    .map((a) => ({
+      app: a.name,
+      hostname: publicHostname(baseDomain!, a.name),
+      service: `http://localhost:${a.port}`,
+      port: a.port!,
+    }));
+
   return c.json({
-    model: {
-      preferred: "cloudflare-tunnel-replicas",
-      mode: "failover",
-      requiredForInternalJobs: false,
-      cost: "free-tier-friendly",
-      baseDomain,
-      hostnames: baseDomain
-        ? {
-            cloud: publicHostname(baseDomain, "cloud"),
-            api: publicHostname(baseDomain, "api"),
-            appsPattern: `*.${baseDomain}`,
-          }
-        : null,
-      tunnelConfigured: tunnelToken === "true",
-      manualSetup: [
-        "Create one Cloudflare Tunnel in Zero Trust (free)",
-        "Install cloudflared on EVERY compute node and run the SAME tunnel (replicas)",
-        "Route app.<base-domain> → http://localhost:<app-port> (same port on each node)",
-        "omc deploy places a container replica on each ONLINE node",
-        "If one node dies, Cloudflare serves another healthy tunnel replica",
-        "Store notes via: omc config set tunnel_notes '...'",
-      ],
-    },
+    baseDomain,
+    mode: "failover",
+    ingress,
+    checklist: [
+      "Create one Cloudflare Tunnel in Zero Trust (free)",
+      "Install cloudflared on EVERY compute node and run the SAME tunnel (replicas)",
+      "Add each ingress hostname → service line below",
+      "omc deploy places a container replica on each ONLINE node",
+      "If one node dies, Cloudflare serves another healthy tunnel replica",
+    ],
   });
 });

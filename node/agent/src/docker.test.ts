@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { executeJob } from "./docker";
+import { buildRunArgs, executeJob } from "./docker";
 import type { JobRecord } from "@omc/protocol";
 
 function job(type: JobRecord["type"], payload: Record<string, unknown>): JobRecord {
@@ -31,9 +31,42 @@ describe("executeJob", () => {
   });
 
   it("rejects unknown docker subcommands via type surface", async () => {
-    // shell is not a JobType; invalid payloads for docker.pull fail clearly
     await expect(
       executeJob(job("docker.pull", {}), async () => undefined),
     ).rejects.toThrow(/image required/);
+  });
+});
+
+describe("buildRunArgs", () => {
+  it("includes memory, cpus, and env flags", () => {
+    const args = buildRunArgs({
+      image: "hashicorp/http-echo:1.0.0",
+      name: "omc-http-echo",
+      publishPort: "5678:5678",
+      memoryMb: 128,
+      cpu: 1,
+      env: { GREETING: "hi", FLAG: "1" },
+      args: ["-listen=:5678"],
+    });
+    expect(args).toEqual([
+      "run",
+      "-d",
+      "--name",
+      "omc-http-echo",
+      "--restart",
+      "unless-stopped",
+      "-p",
+      "5678:5678",
+      "--memory",
+      "128m",
+      "--cpus",
+      "1",
+      "-e",
+      "GREETING=hi",
+      "-e",
+      "FLAG=1",
+      "hashicorp/http-echo:1.0.0",
+      "-listen=:5678",
+    ]);
   });
 });

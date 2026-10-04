@@ -30,6 +30,21 @@ async function docker(
   return result;
 }
 
+export async function listRunningOmcContainers(): Promise<string[]> {
+  const result = await runCommand("docker", [
+    "ps",
+    "--filter",
+    "name=omc-",
+    "--format",
+    "{{.Names}}",
+  ]);
+  if (result.code !== 0) return [];
+  return result.stdout
+    .split("\n")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
 export async function executeJob(
   job: JobRecord,
   onLog: (lines: string[]) => Promise<void>,
@@ -58,6 +73,15 @@ export async function executeJob(
       await docker(["rm", "-f", name], onLog);
       return { name, removed: true };
     }
+    case "docker.logs": {
+      const name = String(payload.name ?? "");
+      if (!name) throw new Error("name required");
+      const tail = Number(payload.tail ?? 100);
+      const safeTail =
+        Number.isFinite(tail) && tail > 0 ? Math.min(Math.floor(tail), 5000) : 100;
+      await docker(["logs", "--tail", String(safeTail), name], onLog);
+      return { name, tail: safeTail };
+    }
     case "docker.run": {
       return runContainer(payload, onLog);
     }
@@ -75,28 +99,57 @@ export async function executeJob(
   }
 }
 
+/** Build docker run args from a payload (exported for tests). */
+export function buildRunArgs(payload: Record<string, unknown>): string[] {
+  const image = String(payload.image ?? "");
+  const name = String(payload.name ?? `omc-${Date.now()}`);
+  const args = (payload.args as string[] | undefined) ?? [];
+  if (!image) throw new Error("image required");
+
+  const runArgs = ["run", "-d", "--name", name, "--restart", "unless-stopped"];
+
+  if (payload.publishPort) {
+    runArgs.push("-p", String(payload.publishPort));
+  } else {
+    runArgs.push("-P");
+  }
+
+  const memoryMb = payload.memoryMb;
+  if (typeof memoryMb === "number" && memoryMb > 0) {
+    runArgs.push("--memory", `${memoryMb}m`);
+  }
+
+  const cpu = payload.cpu;
+  if (typeof cpu === "number" && cpu > 0) {
+    runArgs.push("--cpus", String(cpu));
+  }
+
+  const env = payload.env;
+  if (env && typeof env === "object" && !Array.isArray(env)) {
+    for (const [key, value] of Object.entries(env as Record<string, unknown>)) {
+      if (!key) continue;
+      runArgs.push("-e", `${key}=${String(value)}`);
+    }
+  }
+
+  runArgs.push(image, ...args);
+  return runArgs;
+}
+
 async function runContainer(
   payload: Record<string, unknown>,
   onLog: (lines: string[]) => Promise<void>,
 ): Promise<Record<string, unknown>> {
   const image = String(payload.image ?? "");
   const name = String(payload.name ?? `omc-${Date.now()}`);
-  const args = (payload.args as string[] | undefined) ?? [];
   if (!image) throw new Error("image required");
 
   await docker(["pull", image], onLog).catch(async () => {
     await onLog(["pull failed or skipped; attempting run"]);
   });
-  // Best-effort cleanup of previous container with same name
   await runCommand("docker", ["rm", "-f", name]).catch(() => undefined);
 
-  const runArgs = ["run", "-d", "--name", name, "--restart", "unless-stopped"];
-  if (payload.publishPort) {
-    runArgs.push("-p", String(payload.publishPort));
-  } else {
-    runArgs.push("-P");
-  }
-  runArgs.push(image, ...args);
+  const runArgs = buildRunArgs(payload);
   const result = await docker(runArgs, onLog);
   return {
     containerId: result.stdout.trim(),
@@ -146,6 +199,9 @@ async function deployApp(
       image,
       name: containerName,
       args: sourceArgs,
+      memoryMb: payload.memoryMb,
+      cpu: payload.cpu,
+      env: payload.env,
       publishPort:
         (payload.publishPort as string | undefined) ??
         (payload.containerPort
@@ -155,7 +211,6 @@ async function deployApp(
     onLog,
   );
 
-  // Discover published port for tunnel docs
   const inspect = await runCommand("docker", [
     "inspect",
     "--format",

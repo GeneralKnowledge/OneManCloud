@@ -20,6 +20,7 @@ export interface NodeRow {
   disk_gb: number | null;
   agent_version: string | null;
   last_heartbeat_at: number | null;
+  running_apps_json: string | null;
   created_at: number;
   updated_at: number;
 }
@@ -53,6 +54,7 @@ export interface AppRow {
   public: number;
   sleep: number;
   port: number | null;
+  env_json: string | null;
   created_at: number;
   updated_at: number;
 }
@@ -67,6 +69,35 @@ export interface DeploymentRow {
   updated_at: number;
 }
 
+function parseRunningApps(raw: string | null | undefined): string[] {
+  if (!raw) return [];
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((x): x is string => typeof x === "string");
+  } catch {
+    return [];
+  }
+}
+
+function parseEnv(raw: string | null | undefined): Record<string, string> {
+  if (!raw) return {};
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return {};
+    }
+    const out: Record<string, string> = {};
+    for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+      if (typeof v === "string") out[k] = v;
+      else if (v != null) out[k] = String(v);
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
 export function mapNode(row: NodeRow): NodeRecord {
   return {
     id: row.id,
@@ -79,6 +110,7 @@ export function mapNode(row: NodeRow): NodeRecord {
     diskGb: row.disk_gb,
     agentVersion: row.agent_version,
     lastHeartbeatAt: row.last_heartbeat_at,
+    runningApplications: parseRunningApps(row.running_apps_json),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -102,7 +134,9 @@ export function mapJob(row: JobRow): JobRecord {
   };
 }
 
-export function mapApp(row: AppRow): ApplicationRecord & { sourceArgsJson: string | null } {
+export function mapApp(
+  row: AppRow,
+): ApplicationRecord & { sourceArgsJson: string | null } {
   return {
     id: row.id,
     name: row.name,
@@ -113,8 +147,8 @@ export function mapApp(row: AppRow): ApplicationRecord & { sourceArgsJson: strin
     memoryMb: row.memory_mb,
     cpu: row.cpu,
     public: row.public === 1,
-    sleep: row.sleep === 1,
     port: row.port ?? null,
+    env: parseEnv(row.env_json),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     sourceArgsJson: row.source_args_json,
@@ -174,7 +208,7 @@ export async function markStaleNodesOffline(
   const stale = await db
     .prepare(
       `SELECT id FROM nodes
-       WHERE status IN ('ONLINE', 'REGISTERING', 'DRAINING')
+       WHERE status = 'ONLINE'
          AND (last_heartbeat_at IS NULL OR last_heartbeat_at < ?)`,
     )
     .bind(cutoff)

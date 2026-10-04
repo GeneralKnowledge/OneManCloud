@@ -1,8 +1,6 @@
 export const NODE_STATUSES = [
-  "REGISTERING",
   "ONLINE",
   "OFFLINE",
-  "DRAINING",
   "DISABLED",
 ] as const;
 
@@ -14,7 +12,6 @@ export const JOB_STATUSES = [
   "RUNNING",
   "SUCCEEDED",
   "FAILED",
-  "CANCELLED",
 ] as const;
 
 export type JobStatus = (typeof JOB_STATUSES)[number];
@@ -26,6 +23,7 @@ export const JOB_TYPES = [
   "docker.run",
   "docker.stop",
   "docker.rm",
+  "docker.logs",
   "deploy",
 ] as const;
 
@@ -60,6 +58,7 @@ export interface NodeSummary {
   cpuCount: number | null;
   memoryMb: number | null;
   lastHeartbeatAt: number | null;
+  runningApplications: string[];
 }
 
 export interface ApplicationSummary {
@@ -80,6 +79,7 @@ export interface NodeRecord {
   diskGb: number | null;
   agentVersion: string | null;
   lastHeartbeatAt: number | null;
+  runningApplications: string[];
   createdAt: number;
   updatedAt: number;
 }
@@ -142,8 +142,8 @@ export interface ApplicationRecord {
   memoryMb: number;
   cpu: number;
   public: boolean;
-  sleep: boolean;
   port: number | null;
+  env: Record<string, string>;
   createdAt: number;
   updatedAt: number;
 }
@@ -166,7 +166,8 @@ export interface ApplicationConfig {
     /** Container port; published on the same host port for Tunnel replicas. */
     port?: number;
   };
-  sleep?: boolean;
+  /** Plaintext env vars injected into the container (-e). Personal-use only. */
+  env?: Record<string, string>;
 }
 
 export interface DeploymentRecord {
@@ -179,20 +180,14 @@ export interface DeploymentRecord {
   updatedAt: number;
 }
 
-export type ComputeProviderKind = "oracle" | "local" | "other";
-
-/** Future providers (CloudRun, DockerHost, etc.) only need the node protocol. */
-export interface ComputeProvider {
-  readonly kind: ComputeProviderKind;
-  readonly displayName: string;
+export interface TunnelSuggestResponse {
+  baseDomain: string | null;
+  mode: "failover";
+  ingress: Array<{
+    app: string;
+    hostname: string;
+    service: string;
+    port: number;
+  }>;
+  checklist: string[];
 }
-
-export const OracleNodeProvider: ComputeProvider = {
-  kind: "oracle",
-  displayName: "Oracle ARM Node",
-};
-
-export const LocalNodeProvider: ComputeProvider = {
-  kind: "local",
-  displayName: "Local Node",
-};

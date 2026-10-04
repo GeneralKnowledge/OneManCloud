@@ -3,12 +3,16 @@
 # Prefer cloning this repository and running:
 #   ./scripts/install-node.sh
 # Do not pipe untrusted remote scripts into bash.
+#
+# Register the node from your laptop FIRST (never put OPERATOR_TOKEN on the VM):
+#   omc node register --name oracle-arm
+# Then set OMC_URL + OMC_NODE_TOKEN on the VM.
 set -euo pipefail
 
 OMC_HOME="${OMC_HOME:-/opt/onemancloud}"
 OMC_USER="${OMC_USER:-omc}"
 CONTROL_PLANE_URL="${OMC_URL:-}"
-OPERATOR_TOKEN="${OPERATOR_TOKEN:-}"
+NODE_TOKEN="${OMC_NODE_TOKEN:-}"
 NODE_NAME="${OMC_NODE_NAME:-oracle-arm}"
 
 echo "==> OneManCloud node installer"
@@ -60,29 +64,27 @@ pnpm install --frozen-lockfile=false
 mkdir -p /var/lib/omc
 chown -R "$OMC_USER:$OMC_USER" "$OMC_HOME" /var/lib/omc
 
-if [[ -z "$CONTROL_PLANE_URL" || -z "$OPERATOR_TOKEN" ]]; then
+if [[ -z "$CONTROL_PLANE_URL" || -z "$NODE_TOKEN" ]]; then
   echo
-  echo "Set OMC_URL and OPERATOR_TOKEN then re-run, or write /etc/omc/agent.env"
+  echo "Register from your laptop first:"
+  echo "  omc node register --name ${NODE_NAME}"
+  echo "Then set OMC_URL and OMC_NODE_TOKEN and re-run, or write /etc/omc/agent.env"
 fi
 
 mkdir -p /etc/omc
 cat >/etc/omc/agent.env <<EOF
 OMC_URL=${CONTROL_PLANE_URL}
-OPERATOR_TOKEN=${OPERATOR_TOKEN}
+OMC_NODE_TOKEN=${NODE_TOKEN}
 OMC_NODE_NAME=${NODE_NAME}
 OMC_NODE_STATE=/var/lib/omc/node.json
-OMC_CONFIG=/var/lib/omc/operator.json
 EOF
 chmod 600 /etc/omc/agent.env
 chown "$OMC_USER:$OMC_USER" /etc/omc/agent.env
 
-# Persist operator config for first registration
-if [[ -n "$CONTROL_PLANE_URL" && -n "$OPERATOR_TOKEN" ]]; then
-  cat >/var/lib/omc/operator.json <<EOF
-{"url":"${CONTROL_PLANE_URL}","token":"${OPERATOR_TOKEN}"}
-EOF
-  chmod 600 /var/lib/omc/operator.json
-  chown "$OMC_USER:$OMC_USER" /var/lib/omc/operator.json
+# Remove legacy operator.json if present (operator token must not live on nodes)
+if [[ -f /var/lib/omc/operator.json ]]; then
+  echo "==> Removing legacy /var/lib/omc/operator.json"
+  rm -f /var/lib/omc/operator.json
 fi
 
 cat >/etc/systemd/system/omc-agent.service <<EOF
@@ -118,5 +120,6 @@ echo "    State:   /var/lib/omc/node.json"
 echo
 echo "Security note: Docker access is privileged. The agent can start containers"
 echo "as root inside the Docker daemon trust boundary. Treat node tokens as secrets."
+echo "Never place OPERATOR_TOKEN on a compute node."
 echo
 echo "Cloudflare Tunnel is optional for public apps. See docs/tunnel.md"

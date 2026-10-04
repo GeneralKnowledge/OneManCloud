@@ -1,17 +1,16 @@
 import { describe, expect, it } from "vitest";
-import { JOB_STATUSES, NODE_STATUSES } from "@omc/protocol";
-import { LocalNodeProvider, OracleNodeProvider } from "@omc/protocol";
+import { JOB_STATUSES, JOB_TYPES, NODE_STATUSES } from "@omc/protocol";
 
 describe("protocol contracts", () => {
   it("exposes explicit node and job statuses", () => {
-    expect(NODE_STATUSES).toContain("ONLINE");
-    expect(NODE_STATUSES).toContain("OFFLINE");
+    expect(NODE_STATUSES).toEqual(["ONLINE", "OFFLINE", "DISABLED"]);
     expect(JOB_STATUSES).toContain("QUEUED");
     expect(JOB_STATUSES).toContain("SUCCEEDED");
+    expect(JOB_STATUSES).not.toContain("CANCELLED");
   });
 
-  it("defines compute providers without coupling to Oracle APIs", () => {
-    expect(OracleNodeProvider.kind).toBe("oracle");
-    expect(LocalNodeProvider.kind).toBe("local");
+  it("includes docker.logs for app log jobs", () => {
+    expect(JOB_TYPES).toContain("docker.logs");
+    expect(JOB_TYPES).toContain("deploy");
   });
 });
